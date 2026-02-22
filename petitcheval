@@ -510,25 +510,46 @@ def popup_select(stdscr, title, items, label_fn):
 # The TUI renders a flat list of "rows" built from the task→step tree.
 # Each row is a dict: {"type": "task"|"step", "data": ..., "task_id": ...}
 
-def build_tree(db, workspace_id, collapsed):
+def build_tree(db, workspace_id, collapsed, search_query=""):
     """Build flat row list from tasks + steps for the current workspace."""
     rows = []
+    query = search_query.lower()
     tasks = get_tasks(db, workspace_id, status_filter="active")
     for t in tasks:
         tid = t[0]
         total, done = step_counts(db, tid)
-        rows.append({"type": "task", "id": tid, "name": t[2], "total": total, "done": done})
-        if tid not in collapsed:
-            steps = get_steps(db, tid)
-            for s in steps:
-                rows.append({
-                    "type": "step", "id": s[0], "task_id": s[1],
-                    "text": s[2], "done": s[3], "priority": s[4],
-                })
+        steps = get_steps(db, tid)
+
+        if query:
+            task_matches = query in t[2].lower()
+            matching_steps = [s for s in steps if query in s[2].lower()]
+            if not task_matches and not matching_steps:
+                continue
+            rows.append({
+                "type": "task", "id": tid, "name": t[2], "total": total, "done": done,
+                "collapsed": tid in collapsed,
+            })
+            if tid not in collapsed:
+                for s in (matching_steps if not task_matches else steps):
+                    rows.append({
+                        "type": "step", "id": s[0], "task_id": s[1],
+                        "text": s[2], "done": s[3], "priority": s[4],
+                    })
+        else:
+            rows.append({
+                "type": "task", "id": tid, "name": t[2], "total": total, "done": done,
+                "collapsed": tid in collapsed,
+            })
+            if tid not in collapsed:
+                for s in steps:
+                    rows.append({
+                        "type": "step", "id": s[0], "task_id": s[1],
+                        "text": s[2], "done": s[3], "priority": s[4],
+                    })
     return rows
 
 
-def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name):
+def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name, search_query=""):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
@@ -545,6 +566,8 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name):
 
     # Title bar
     title = f" petitcheval  [{ws_name}] "
+    if search_query:
+        title += f" / \"{search_query}\" "
     stdscr.attron(TITLE)
     stdscr.addnstr(0, 0, " " * (w - 1), w - 1)
     stdscr.addnstr(0, 1, title[:w - 2], w - 2)
@@ -571,7 +594,7 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name):
             stdscr.addnstr(row_y, 0, " " * (w - 1), w - 1, base)
 
             if r["type"] == "task":
-                arrow = "▾" if True else "▸"  # collapsed state handled by presence of children
+                arrow = "▸" if r.get("collapsed") else "▾"
                 count_s = f"[{r['done']}/{r['total']}]"
                 # Check if all done
                 all_done = r["total"] > 0 and r["done"] == r["total"]
@@ -601,7 +624,7 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name):
         stdscr.attroff(STATUS)
 
     # Help bar
-    help_text = " A:new task  a:new step  enter:toggle  e:edit  p:priority  d:del  w:workspace  q:quit "
+    help_text = " A:task  a:step  enter:toggle  e:edit  p:priority  d:del  f:search  w:workspace  q:quit "
     stdscr.attron(HELP)
     stdscr.addnstr(h - 1, 0, " " * (w - 1), w - 1)
     stdscr.addnstr(h - 1, max(0, (w - len(help_text)) // 2), help_text[:w - 1], w - 1)
@@ -634,9 +657,10 @@ def tui_main(stdscr):
     cursor_pos = 0
     scroll_offset = 0
     status_msg = ""
+    search_query = ""
 
     while True:
-        rows = build_tree(db, current_ws_id, collapsed)
+        rows = build_tree(db, current_ws_id, collapsed, search_query)
         h, w = stdscr.getmaxyx()
         visible = h - 5
 
@@ -650,7 +674,7 @@ def tui_main(stdscr):
             cursor_pos = 0
             scroll_offset = 0
 
-        draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, current_ws_name)
+        draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, current_ws_name, search_query)
         status_msg = ""
 
         try:
@@ -774,6 +798,15 @@ def tui_main(stdscr):
                     idx = (order.index(r["priority"]) + 1) % 3
                     db.execute("UPDATE steps SET priority = ? WHERE id = ?", (order[idx], r["id"]))
                     db.commit()
+
+        # Search
+        elif ch == "f":
+            query = textbox_input(stdscr, "Search (ESC to clear):")
+            if query is None:
+                search_query = ""
+            else:
+                search_query = query.strip()
+            cursor_pos, scroll_offset = 0, 0
 
         # Workspace switcher
         elif ch == "w":
