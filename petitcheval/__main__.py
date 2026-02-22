@@ -3,7 +3,7 @@
 import curses
 import sys
 
-from .cli import cli_error, cli_step, cli_task, cli_workspace
+from .cli import cli_dump, cli_error, cli_step, cli_task, cli_workspace
 from .db import get_db
 
 HELP = """\
@@ -15,19 +15,25 @@ Usage:
   petitcheval --help | -h              Show this help
 
 Commands:
+  dump [--workspace <name|id>]         Full nested JSON tree (one call to see everything)
+
   workspace list                       List all workspaces
   workspace add <name>                 Create a workspace
   workspace rm <id>                    Delete a workspace
 
-  task list [--workspace <name|id>]    List tasks
+  task list [--workspace <name|id>] [--status active|in_progress|done]
   task add <name> --workspace <name|id>
+  task start <id>                      Mark task as in_progress
+  task done <id>                       Mark task as done
+  task undone <id>                     Reset task to active
   task rm <id>
 
   step list [--task <id>] [--workspace <name|id>] [--status pending|done|all]
-  step add <text> --task <id> [-p high|medium|low]
+  step add <text> --task <id> [-p high|medium|low] [--note <text>]
   step done <id>
   step undone <id>
   step edit <id> <text>
+  step note <id> <text>                Set/update a note on a step
   step rm <id>
 
 TUI keybindings:
@@ -35,8 +41,11 @@ TUI keybindings:
   Enter      Toggle collapse (task) / toggle done (step)
   A          New task
   a          New step under current task
+  s          Cycle task status (active -> in_progress -> done)
   e          Edit selected item
+  n          Add/edit note on step
   d          Delete selected item
+  D          Toggle showing done tasks
   p          Cycle step priority
   f          Search / filter
   w          Switch workspace
@@ -60,14 +69,16 @@ def main():
     resource = args[0]
     rest = args[1:]
 
-    if resource == "workspace":
+    if resource == "dump":
+        cli_dump(db, rest)
+    elif resource == "workspace":
         cli_workspace(db, rest)
     elif resource == "task":
         cli_task(db, rest)
     elif resource == "step":
         cli_step(db, rest)
     else:
-        cli_error(f"Unknown command: {resource}. Use workspace, task, or step.")
+        cli_error(f"Unknown command: {resource}. Use dump, workspace, task, or step.")
 
 
 if __name__ == "__main__":

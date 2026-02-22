@@ -102,41 +102,51 @@ def popup_select(stdscr, title, items, label_fn):
 
 # ── Tree model ──────────────────────────────────────────────────────────────
 
-def build_tree(db, workspace_id, collapsed, search_query=""):
-    """Build a flat list of rows from the task→step tree for rendering."""
+TASK_STATUS_ICON = {
+    "active": " ",
+    "in_progress": ">",
+    "done": "x",
+}
+
+
+def build_tree(db, workspace_id, collapsed, search_query="", show_done_tasks=False):
+    """Build a flat list of rows from the task->step tree for rendering."""
     rows = []
     query = search_query.lower()
-    tasks = get_tasks(db, workspace_id, status_filter="active")
+    tasks = get_tasks(db, workspace_id)
     for t in tasks:
         tid = t[0]
+        t_status = t[3]
+        if t_status == "done" and not show_done_tasks and not query:
+            continue
         total, done = step_counts(db, tid)
         steps = get_steps(db, tid)
 
         if query:
             task_matches = query in t[2].lower()
-            matching_steps = [s for s in steps if query in s[2].lower()]
+            matching_steps = [s for s in steps if query in s[2].lower() or query in s[7].lower()]
             if not task_matches and not matching_steps:
                 continue
             rows.append({
                 "type": "task", "id": tid, "name": t[2], "total": total, "done": done,
-                "collapsed": tid in collapsed,
+                "status": t_status, "collapsed": tid in collapsed,
             })
             if tid not in collapsed:
                 for s in (matching_steps if not task_matches else steps):
                     rows.append({
                         "type": "step", "id": s[0], "task_id": s[1],
-                        "text": s[2], "done": s[3], "priority": s[4],
+                        "text": s[2], "done": s[3], "priority": s[4], "note": s[7],
                     })
         else:
             rows.append({
                 "type": "task", "id": tid, "name": t[2], "total": total, "done": done,
-                "collapsed": tid in collapsed,
+                "status": t_status, "collapsed": tid in collapsed,
             })
             if tid not in collapsed:
                 for s in steps:
                     rows.append({
                         "type": "step", "id": s[0], "task_id": s[1],
-                        "text": s[2], "done": s[3], "priority": s[4],
+                        "text": s[2], "done": s[3], "priority": s[4], "note": s[7],
                     })
     return rows
 
@@ -157,6 +167,7 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name, sear
     SELECTED = curses.A_REVERSE
     priority_attr = {"high": HIGH, "medium": MED, "low": LOW}
     priority_icon = {"high": "!!!", "medium": " ! ", "low": " . "}
+    status_attr = {"active": 0, "in_progress": MED | curses.A_BOLD, "done": DIM}
 
     # Title bar
     title = f" petitcheval  [{ws_name}] "
@@ -189,24 +200,39 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name, sear
 
             if r["type"] == "task":
                 arrow = "▸" if r.get("collapsed") else "▾"
+                t_status = r.get("status", "active")
+                icon = TASK_STATUS_ICON.get(t_status, " ")
                 count_s = f"[{r['done']}/{r['total']}]"
                 all_done = r["total"] > 0 and r["done"] == r["total"]
-                name_attr = base | (DIM if all_done else curses.A_BOLD)
-                stdscr.addnstr(row_y, 1, arrow, 1, base)
-                stdscr.addnstr(row_y, 3, r["name"][:w - 15], w - 15, name_attr)
-                stdscr.addnstr(row_y, max(3, w - len(count_s) - 2), count_s, len(count_s),
-                               base | (LOW if all_done else MED))
+                is_done_task = t_status == "done"
+
+                # Status icon
+                s_attr = status_attr.get(t_status, 0)
+                stdscr.addnstr(row_y, 1, arrow, 1, base | s_attr)
+                stdscr.addnstr(row_y, 2, icon, 1, base | s_attr)
+
+                name_attr = base | (DIM if is_done_task else (curses.A_BOLD if t_status == "in_progress" else 0))
+                stdscr.addnstr(row_y, 4, r["name"][:w - 16], w - 16, name_attr)
+                stdscr.addnstr(row_y, max(4, w - len(count_s) - 2), count_s, len(count_s),
+                               base | (LOW if all_done or is_done_task else MED))
             else:
                 check = "[x]" if r["done"] else "[ ]"
                 prio = r["priority"]
                 ptag = priority_icon.get(prio, " ? ")
                 text = r["text"]
+                note = r.get("note", "")
                 step_attr = base | (DIM if r["done"] else 0)
 
                 stdscr.addnstr(row_y, 3, check, 3, step_attr)
                 stdscr.addnstr(row_y, 7, ptag, 3, base | priority_attr.get(prio, 0))
-                max_tw = w - 12
-                stdscr.addnstr(row_y, 11, text[:max_tw], max_tw, step_attr)
+
+                if note:
+                    max_tw = w - 12
+                    display = f"{text}  [{note}]"
+                    stdscr.addnstr(row_y, 11, display[:max_tw], max_tw, step_attr)
+                else:
+                    max_tw = w - 12
+                    stdscr.addnstr(row_y, 11, text[:max_tw], max_tw, step_attr)
 
     # Status message
     if status_msg:
@@ -216,7 +242,7 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name, sear
         stdscr.attroff(STATUS)
 
     # Help bar
-    help_text = " A:task  a:step  enter:toggle  e:edit  p:priority  d:del  f:search  w:workspace  q:quit "
+    help_text = " A:task  a:step  enter:toggle  s:status  e:edit  n:note  p:prio  d:del  f:find  w:ws  q:quit "
     stdscr.attron(HELP)
     stdscr.addnstr(h - 1, 0, " " * (w - 1), w - 1)
     stdscr.addnstr(h - 1, max(0, (w - len(help_text)) // 2), help_text[:w - 1], w - 1)
@@ -226,6 +252,9 @@ def draw_tree(stdscr, rows, cursor_pos, scroll_offset, status_msg, ws_name, sear
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────
+
+TASK_STATUS_CYCLE = ["active", "in_progress", "done"]
+
 
 def tui_main(stdscr):
     curses.curs_set(0)
@@ -253,9 +282,10 @@ def tui_main(stdscr):
     scroll_offset = 0
     status_msg = ""
     search_query = ""
+    show_done_tasks = False
 
     while True:
-        rows = build_tree(db, current_ws_id, collapsed, search_query)
+        rows = build_tree(db, current_ws_id, collapsed, search_query, show_done_tasks)
         h, w = stdscr.getmaxyx()
         visible = h - 5
 
@@ -316,6 +346,18 @@ def tui_main(stdscr):
                     db.commit()
                     status_msg = f"{'Unchecked' if r['done'] else 'Completed'}: {r['text']}"
 
+        # Cycle task status (s)
+        elif ch == "s":
+            if rows:
+                r = rows[cursor_pos]
+                if r["type"] == "task":
+                    cur_status = r.get("status", "active")
+                    idx = TASK_STATUS_CYCLE.index(cur_status) if cur_status in TASK_STATUS_CYCLE else 0
+                    new_status = TASK_STATUS_CYCLE[(idx + 1) % len(TASK_STATUS_CYCLE)]
+                    db.execute("UPDATE tasks SET status = ? WHERE id = ?", (new_status, r["id"]))
+                    db.commit()
+                    status_msg = f"{r['name']}: {new_status}"
+
         # New task (A)
         elif ch == "A":
             name = textbox_input(stdscr, "New task name (ESC to cancel):")
@@ -339,7 +381,7 @@ def tui_main(stdscr):
                     text = text.strip()
                     now = datetime.now().isoformat()
                     db.execute(
-                        "INSERT INTO steps (task_id, text, priority, created_at) VALUES (?, ?, 'medium', ?)",
+                        "INSERT INTO steps (task_id, text, priority, note, created_at) VALUES (?, ?, 'medium', '', ?)",
                         (task_id, text, now),
                     )
                     db.commit()
@@ -364,6 +406,18 @@ def tui_main(stdscr):
                         db.execute("UPDATE steps SET text = ? WHERE id = ?", (new_text.strip(), r["id"]))
                         db.commit()
                         status_msg = "Updated step"
+
+        # Add/edit note on step (n)
+        elif ch == "n":
+            if rows:
+                r = rows[cursor_pos]
+                if r["type"] == "step":
+                    current_note = r.get("note", "")
+                    new_note = textbox_input(stdscr, "Note (ESC to cancel):", prefill=current_note)
+                    if new_note is not None:
+                        db.execute("UPDATE steps SET note = ? WHERE id = ?", (new_note.strip(), r["id"]))
+                        db.commit()
+                        status_msg = "Updated note" if new_note.strip() else "Cleared note"
 
         # Delete
         elif ch == "d" or ch == curses.KEY_DC:
@@ -397,6 +451,11 @@ def tui_main(stdscr):
             else:
                 search_query = query.strip()
             cursor_pos, scroll_offset = 0, 0
+
+        # Toggle showing done tasks
+        elif ch == "D":
+            show_done_tasks = not show_done_tasks
+            status_msg = f"Done tasks: {'shown' if show_done_tasks else 'hidden'}"
 
         # Workspace switcher
         elif ch == "w":

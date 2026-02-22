@@ -34,6 +34,7 @@ def get_db():
             text TEXT NOT NULL,
             done INTEGER NOT NULL DEFAULT 0,
             priority TEXT NOT NULL DEFAULT 'medium',
+            note TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             completed_at TEXT
         )"""
@@ -41,6 +42,7 @@ def get_db():
 
     _migrate_flat_todos(conn)
     _migrate_plans(conn)
+    _migrate_add_note_column(conn)
 
     # Ensure at least one workspace exists
     if not conn.execute("SELECT 1 FROM workspaces LIMIT 1").fetchone():
@@ -138,3 +140,11 @@ def _migrate_plans(conn):
         pass
     conn.execute("DROP TABLE plans")
     conn.commit()
+
+
+def _migrate_add_note_column(conn):
+    """Add note column to steps if missing (for existing databases)."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(steps)").fetchall()]
+    if "note" not in cols:
+        conn.execute("ALTER TABLE steps ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        conn.commit()
