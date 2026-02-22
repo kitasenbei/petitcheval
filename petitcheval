@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""A TODO TUI app using ncurses and SQLite — with workspaces, plans & CLI API."""
+
+import curses
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime
+
+DB_PATH = os.path.join(os.path.expanduser("~"), ".todo.db")
+
+
+# ── Database ────────────────────────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS workspaces (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        )"""
+    )
+
+    # Original todos table (may already exist)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            priority TEXT NOT NULL DEFAULT 'medium',
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )"""
+    )
+
+    # Migration: add plan_id column if missing
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(todos)").fetchall()]
+    if "plan_id" not in cols:
+        conn.execute("ALTER TABLE todos ADD COLUMN plan_id INTEGER REFERENCES plans(id) ON DELETE CASCADE")
+
+    # Ensure a "default" workspace + plan exists and adopt orphan todos
+    now = datetime.now().isoformat()
+    row = conn.execute("SELECT id FROM workspaces WHERE name = 'default'").fetchone()
+    if row:
+        ws_id = row[0]
+    else:
+        cur = conn.execute("INSERT INTO workspaces (name, created_at) VALUES ('default', ?)", (now,))
+        ws_id = cur.lastrowid
+
+    row = conn.execute("SELECT id FROM plans WHERE workspace_id = ? AND name = 'default'", (ws_id,)).fetchone()
+    if row:
+        plan_id = row[0]
+    else:
+        cur = conn.execute(
+            "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, 'default', 'active', ?)",
+            (ws_id, now),
+        )
+        plan_id = cur.lastrowid
+
+    conn.execute("UPDATE todos SET plan_id = ? WHERE plan_id IS NULL", (plan_id,))
+    conn.commit()
+    return conn
+
+
+# ── Data helpers ────────────────────────────────────────────────────────────
+
+def load_todos(db, plan_id=None, workspace_id=None, status_filter="all"):
+    clauses, params = [], []
+    if plan_id is not None:
+        clauses.append("t.plan_id = ?")
+        params.append(plan_id)
+    elif workspace_id is not None:
+        clauses.append("p.workspace_id = ?")
+        params.append(workspace_id)
+    if status_filter == "pending":
+        clauses.append("t.done = 0")
+    elif status_filter == "done":
+        clauses.append("t.done = 1")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return db.execute(
+        f"SELECT t.id, t.task, t.done, t.priority, t.plan_id "
+        f"FROM todos t JOIN plans p ON t.plan_id = p.id {where} "
+        f"ORDER BY t.done, CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, t.id",
+        params,
+    ).fetchall()
+
+
+def add_todo(db, task, plan_id, priority="medium"):
+    now = datetime.now().isoformat()
+    cur = db.execute(
+        "INSERT INTO todos (task, priority, created_at, plan_id) VALUES (?, ?, ?, ?)",
+        (task, priority, now, plan_id),
+    )
+    db.commit()
+    return cur.lastrowid
+
+
+def toggle_todo(db, todo_id, current_done):
+    if current_done:
+        db.execute("UPDATE todos SET done = 0, completed_at = NULL WHERE id = ?", (todo_id,))
+    else:
+        db.execute(
+            "UPDATE todos SET done = 1, completed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), todo_id),
+        )
+    db.commit()
+
+
+def delete_todo(db, todo_id):
+    db.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+    db.commit()
+
+
+def edit_todo(db, todo_id, new_task):
+    db.execute("UPDATE todos SET task = ? WHERE id = ?", (new_task, todo_id))
+    db.commit()
+
+
+def cycle_priority(db, todo_id, current_priority):
+    order = ["low", "medium", "high"]
+    idx = (order.index(current_priority) + 1) % 3
+    db.execute("UPDATE todos SET priority = ? WHERE id = ?", (order[idx], todo_id))
+    db.commit()
+
+
+def clear_done(db, plan_id):
+    db.execute("DELETE FROM todos WHERE done = 1 AND plan_id = ?", (plan_id,))
+    db.commit()
+
+
+# ── Workspace / plan helpers ───────────────────────────────────────────────
+
+def resolve_workspace(db, name_or_id):
+    """Return workspace row (id, name, created_at) by name or numeric id."""
+    if name_or_id.isdigit():
+        row = db.execute("SELECT id, name, created_at FROM workspaces WHERE id = ?", (int(name_or_id),)).fetchone()
+    else:
+        row = db.execute("SELECT id, name, created_at FROM workspaces WHERE name = ?", (name_or_id,)).fetchone()
+    return row
+
+
+def get_plans_for_workspace(db, workspace_id, status_filter=None):
+    if status_filter:
+        return db.execute(
+            "SELECT id, workspace_id, name, status, created_at FROM plans WHERE workspace_id = ? AND status = ? ORDER BY id",
+            (workspace_id, status_filter),
+        ).fetchall()
+    return db.execute(
+        "SELECT id, workspace_id, name, status, created_at FROM plans WHERE workspace_id = ? ORDER BY id",
+        (workspace_id,),
+    ).fetchall()
+
+
+# ── CLI API ─────────────────────────────────────────────────────────────────
+
+def cli_error(msg):
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(1)
+
+
+def cli_workspace(db, args):
+    if not args:
+        cli_error("Usage: petitcheval workspace <list|add|rm> ...")
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "list":
+        rows = db.execute("SELECT id, name, created_at FROM workspaces ORDER BY id").fetchall()
+        print(json.dumps([{"id": r[0], "name": r[1], "created_at": r[2]} for r in rows]))
+
+    elif cmd == "add":
+        if not rest:
+            cli_error("Usage: petitcheval workspace add <name>")
+        name = rest[0]
+        if db.execute("SELECT 1 FROM workspaces WHERE name = ?", (name,)).fetchone():
+            cli_error(f"Workspace '{name}' already exists")
+        now = datetime.now().isoformat()
+        cur = db.execute("INSERT INTO workspaces (name, created_at) VALUES (?, ?)", (name, now))
+        ws_id = cur.lastrowid
+        # Auto-create a default plan
+        db.execute(
+            "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, 'default', 'active', ?)",
+            (ws_id, now),
+        )
+        db.commit()
+        print(json.dumps({"id": ws_id, "name": name, "created_at": now}))
+
+    elif cmd == "rm":
+        if not rest:
+            cli_error("Usage: petitcheval workspace rm <id>")
+        ws_id = int(rest[0])
+        if not db.execute("SELECT 1 FROM workspaces WHERE id = ?", (ws_id,)).fetchone():
+            cli_error(f"Workspace {ws_id} not found")
+        db.execute("DELETE FROM workspaces WHERE id = ?", (ws_id,))
+        db.commit()
+        print(json.dumps({"deleted": ws_id}))
+
+    else:
+        cli_error(f"Unknown workspace command: {cmd}")
+
+
+def cli_plan(db, args):
+    if not args:
+        cli_error("Usage: petitcheval plan <list|add|rm> ...")
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "list":
+        ws_id = None
+        if "--workspace" in rest:
+            idx = rest.index("--workspace")
+            if idx + 1 >= len(rest):
+                cli_error("--workspace requires a value")
+            ws = resolve_workspace(db, rest[idx + 1])
+            if not ws:
+                cli_error(f"Workspace '{rest[idx + 1]}' not found")
+            ws_id = ws[0]
+        if ws_id:
+            rows = db.execute(
+                "SELECT id, workspace_id, name, status, created_at FROM plans WHERE workspace_id = ? ORDER BY id",
+                (ws_id,),
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT id, workspace_id, name, status, created_at FROM plans ORDER BY id").fetchall()
+        print(json.dumps([
+            {"id": r[0], "workspace_id": r[1], "name": r[2], "status": r[3], "created_at": r[4]} for r in rows
+        ]))
+
+    elif cmd == "add":
+        if not rest:
+            cli_error("Usage: petitcheval plan add <name> --workspace <name|id>")
+        name = rest[0]
+        if "--workspace" not in rest:
+            cli_error("--workspace is required")
+        idx = rest.index("--workspace")
+        if idx + 1 >= len(rest):
+            cli_error("--workspace requires a value")
+        ws = resolve_workspace(db, rest[idx + 1])
+        if not ws:
+            cli_error(f"Workspace '{rest[idx + 1]}' not found")
+        now = datetime.now().isoformat()
+        cur = db.execute(
+            "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, ?, 'active', ?)",
+            (ws[0], name, now),
+        )
+        db.commit()
+        print(json.dumps({"id": cur.lastrowid, "workspace_id": ws[0], "name": name, "status": "active", "created_at": now}))
+
+    elif cmd == "rm":
+        if not rest:
+            cli_error("Usage: petitcheval plan rm <id>")
+        plan_id = int(rest[0])
+        if not db.execute("SELECT 1 FROM plans WHERE id = ?", (plan_id,)).fetchone():
+            cli_error(f"Plan {plan_id} not found")
+        db.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+        db.commit()
+        print(json.dumps({"deleted": plan_id}))
+
+    else:
+        cli_error(f"Unknown plan command: {cmd}")
+
+
+def cli_task(db, args):
+    if not args:
+        cli_error("Usage: petitcheval task <list|add|done|undone|edit|rm> ...")
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "list":
+        plan_id = None
+        ws_id = None
+        status_filter = "all"
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--plan" and i + 1 < len(rest):
+                plan_id = int(rest[i + 1]); i += 2
+            elif rest[i] == "--workspace" and i + 1 < len(rest):
+                ws = resolve_workspace(db, rest[i + 1])
+                if not ws:
+                    cli_error(f"Workspace '{rest[i + 1]}' not found")
+                ws_id = ws[0]; i += 2
+            elif rest[i] == "--status" and i + 1 < len(rest):
+                status_filter = rest[i + 1]; i += 2
+            else:
+                i += 1
+        rows = load_todos(db, plan_id=plan_id, workspace_id=ws_id, status_filter=status_filter)
+        print(json.dumps([
+            {"id": r[0], "task": r[1], "done": bool(r[2]), "priority": r[3], "plan_id": r[4]} for r in rows
+        ]))
+
+    elif cmd == "add":
+        if not rest:
+            cli_error("Usage: petitcheval task add <text> --plan <id> [-p high|medium|low]")
+        text_parts = []
+        plan_id = None
+        priority = "medium"
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--plan" and i + 1 < len(rest):
+                plan_id = int(rest[i + 1]); i += 2
+            elif rest[i] == "-p" and i + 1 < len(rest):
+                priority = rest[i + 1]; i += 2
+            else:
+                text_parts.append(rest[i]); i += 1
+        if not text_parts:
+            cli_error("Task text is required")
+        if plan_id is None:
+            cli_error("--plan is required")
+        if not db.execute("SELECT 1 FROM plans WHERE id = ?", (plan_id,)).fetchone():
+            cli_error(f"Plan {plan_id} not found")
+        text = " ".join(text_parts)
+        tid = add_todo(db, text, plan_id, priority)
+        print(json.dumps({"id": tid, "task": text, "plan_id": plan_id, "priority": priority, "done": False}))
+
+    elif cmd == "done":
+        if not rest:
+            cli_error("Usage: petitcheval task done <id>")
+        tid = int(rest[0])
+        row = db.execute("SELECT done FROM todos WHERE id = ?", (tid,)).fetchone()
+        if not row:
+            cli_error(f"Task {tid} not found")
+        db.execute("UPDATE todos SET done = 1, completed_at = ? WHERE id = ?", (datetime.now().isoformat(), tid))
+        db.commit()
+        print(json.dumps({"id": tid, "done": True}))
+
+    elif cmd == "undone":
+        if not rest:
+            cli_error("Usage: petitcheval task undone <id>")
+        tid = int(rest[0])
+        row = db.execute("SELECT done FROM todos WHERE id = ?", (tid,)).fetchone()
+        if not row:
+            cli_error(f"Task {tid} not found")
+        db.execute("UPDATE todos SET done = 0, completed_at = NULL WHERE id = ?", (tid,))
+        db.commit()
+        print(json.dumps({"id": tid, "done": False}))
+
+    elif cmd == "edit":
+        if len(rest) < 2:
+            cli_error("Usage: petitcheval task edit <id> <text>")
+        tid = int(rest[0])
+        new_text = " ".join(rest[1:])
+        row = db.execute("SELECT 1 FROM todos WHERE id = ?", (tid,)).fetchone()
+        if not row:
+            cli_error(f"Task {tid} not found")
+        db.execute("UPDATE todos SET task = ? WHERE id = ?", (new_text, tid))
+        db.commit()
+        print(json.dumps({"id": tid, "task": new_text}))
+
+    elif cmd == "rm":
+        if not rest:
+            cli_error("Usage: petitcheval task rm <id>")
+        tid = int(rest[0])
+        if not db.execute("SELECT 1 FROM todos WHERE id = ?", (tid,)).fetchone():
+            cli_error(f"Task {tid} not found")
+        db.execute("DELETE FROM todos WHERE id = ?", (tid,))
+        db.commit()
+        print(json.dumps({"deleted": tid}))
+
+    else:
+        cli_error(f"Unknown task command: {cmd}")
+
+
+# ── TUI ─────────────────────────────────────────────────────────────────────
+
+def textbox_input(stdscr, prompt, prefill=""):
+    """Simple single-line text input at the bottom of screen."""
+    h, w = stdscr.getmaxyx()
+    y = h - 2
+    stdscr.attron(curses.A_REVERSE)
+    stdscr.addnstr(y, 0, " " * (w - 1), w - 1)
+    stdscr.addnstr(y, 1, prompt, w - 2)
+    stdscr.attroff(curses.A_REVERSE)
+    stdscr.refresh()
+
+    curses.curs_set(1)
+    buf = list(prefill)
+    cursor = len(buf)
+
+    while True:
+        input_y = y + 1
+        stdscr.move(input_y, 0)
+        stdscr.clrtoeol()
+        display = "".join(buf)
+        stdscr.addnstr(input_y, 1, display, w - 2)
+        stdscr.move(input_y, 1 + cursor)
+        stdscr.refresh()
+
+        ch = stdscr.get_wch()
+
+        if ch == "\n":
+            curses.curs_set(0)
+            return "".join(buf)
+        elif ch == "\x1b":
+            curses.curs_set(0)
+            return None
+        elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            if cursor > 0:
+                buf.pop(cursor - 1)
+                cursor -= 1
+        elif ch == curses.KEY_DC:
+            if cursor < len(buf):
+                buf.pop(cursor)
+        elif ch == curses.KEY_LEFT:
+            cursor = max(0, cursor - 1)
+        elif ch == curses.KEY_RIGHT:
+            cursor = min(len(buf), cursor + 1)
+        elif ch == curses.KEY_HOME:
+            cursor = 0
+        elif ch == curses.KEY_END:
+            cursor = len(buf)
+        elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+            buf.insert(cursor, ch)
+            cursor += 1
+
+
+def popup_select(stdscr, title, items, label_fn):
+    """Show a centered popup list. Returns selected item or None on ESC."""
+    h, w = stdscr.getmaxyx()
+    box_w = min(w - 4, 50)
+    box_h = min(h - 4, len(items) + 2)
+    start_y = (h - box_h) // 2
+    start_x = (w - box_w) // 2
+    sel = 0
+    scroll = 0
+    inner_h = box_h - 2
+
+    while True:
+        # Draw box
+        for row in range(box_h):
+            stdscr.addnstr(start_y + row, start_x, " " * box_w, box_w, curses.A_REVERSE)
+        stdscr.addnstr(start_y, start_x + 1, title[:box_w - 2], box_w - 2, curses.A_REVERSE | curses.A_BOLD)
+
+        for i in range(inner_h):
+            idx = i + scroll
+            if idx >= len(items):
+                break
+            label = label_fn(items[idx])[:box_w - 4]
+            attr = curses.A_REVERSE
+            if idx == sel:
+                attr = curses.color_pair(1) | curses.A_BOLD
+            stdscr.addnstr(start_y + 1 + i, start_x + 1, f" {label:<{box_w - 3}}", box_w - 2, attr)
+        stdscr.refresh()
+
+        ch = stdscr.get_wch()
+        if ch == "\x1b":
+            return None
+        elif ch in ("k", curses.KEY_UP):
+            sel = max(0, sel - 1)
+            if sel < scroll:
+                scroll = sel
+        elif ch in ("j", curses.KEY_DOWN):
+            sel = min(len(items) - 1, sel + 1)
+            if sel >= scroll + inner_h:
+                scroll = sel - inner_h + 1
+        elif ch == "\n":
+            return items[sel]
+
+
+def draw(stdscr, todos, cursor_pos, scroll_offset, status_msg, ws_name, plan_name):
+    stdscr.erase()
+    h, w = stdscr.getmaxyx()
+
+    TITLE = curses.color_pair(1) | curses.A_BOLD
+    HIGH = curses.color_pair(2)
+    MED = curses.color_pair(3)
+    LOW = curses.color_pair(4)
+    DONE_STYLE = curses.color_pair(5)
+    SELECTED = curses.A_REVERSE
+    HELP = curses.color_pair(6)
+
+    priority_attr = {"high": HIGH, "medium": MED, "low": LOW}
+    priority_icon = {"high": "!!!", "medium": " ! ", "low": " . "}
+
+    # Title bar
+    title = f" petitcheval  [{ws_name} / {plan_name}] "
+    stdscr.attron(TITLE)
+    stdscr.addnstr(0, 0, " " * (w - 1), w - 1)
+    stdscr.addnstr(0, 1, title[:w - 2], w - 2)
+    stdscr.attroff(TITLE)
+
+    # Count
+    total = len(todos)
+    done_count = sum(1 for t in todos if t[2])
+    count_str = f" {done_count}/{total} done "
+    if total > 0:
+        stdscr.addnstr(0, max(1, w - len(count_str) - 1), count_str, len(count_str), TITLE)
+
+    # List area
+    list_top = 2
+    list_bottom = h - 3
+    visible = list_bottom - list_top
+
+    if not todos:
+        msg = "No tasks yet. Press 'a' to add one."
+        stdscr.addnstr(list_top + 1, (w - len(msg)) // 2, msg, w - 1, DONE_STYLE)
+    else:
+        for i in range(visible):
+            idx = i + scroll_offset
+            if idx >= len(todos):
+                break
+            row_y = list_top + i
+            todo_id, task, done, priority = todos[idx][0], todos[idx][1], todos[idx][2], todos[idx][3]
+
+            is_selected = idx == cursor_pos
+            attr = SELECTED if is_selected else 0
+
+            stdscr.addnstr(row_y, 0, " " * (w - 1), w - 1, attr)
+
+            check = "[x]" if done else "[ ]"
+            stdscr.addnstr(row_y, 1, check, 3, attr | (DONE_STYLE if done else 0))
+
+            ptag = priority_icon.get(priority, " ? ")
+            stdscr.addnstr(row_y, 5, ptag, 3, attr | priority_attr.get(priority, 0))
+
+            task_attr = attr | (DONE_STYLE if done else 0)
+            max_task_w = w - 10
+            display_task = task[:max_task_w] if len(task) > max_task_w else task
+            stdscr.addnstr(row_y, 9, display_task, max_task_w, task_attr)
+
+    # Status message
+    if status_msg:
+        stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+        stdscr.addnstr(h - 3, 0, " " * (w - 1), w - 1)
+        stdscr.addnstr(h - 3, 1, status_msg, w - 2)
+        stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+
+    help_text = " a:add  enter:toggle  e:edit  p:priority  d:del  c:clear  w:workspace  Tab:plan  n:new plan  q:quit "
+    stdscr.attron(HELP)
+    stdscr.addnstr(h - 1, 0, " " * (w - 1), w - 1)
+    stdscr.addnstr(h - 1, max(0, (w - len(help_text)) // 2), help_text[:w - 1], w - 1)
+    stdscr.attroff(HELP)
+
+    stdscr.refresh()
+
+
+def tui_main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(2, curses.COLOR_RED, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_GREEN, -1)
+    curses.init_pair(5, curses.COLOR_WHITE + 8 if curses.COLORS > 8 else curses.COLOR_WHITE, -1)
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(7, curses.COLOR_YELLOW, -1)
+
+    db = get_db()
+
+    # Start with "default" workspace + plan
+    ws_row = db.execute("SELECT id, name FROM workspaces WHERE name = 'default'").fetchone()
+    current_ws_id, current_ws_name = ws_row[0], ws_row[1]
+    plan_row = db.execute(
+        "SELECT id, name FROM plans WHERE workspace_id = ? AND status = 'active' ORDER BY id LIMIT 1",
+        (current_ws_id,),
+    ).fetchone()
+    current_plan_id, current_plan_name = plan_row[0], plan_row[1]
+
+    cursor_pos = 0
+    scroll_offset = 0
+    status_msg = ""
+
+    while True:
+        todos = load_todos(db, plan_id=current_plan_id)
+        h, w = stdscr.getmaxyx()
+        visible = h - 5
+
+        if todos:
+            cursor_pos = max(0, min(cursor_pos, len(todos) - 1))
+            if cursor_pos < scroll_offset:
+                scroll_offset = cursor_pos
+            if cursor_pos >= scroll_offset + visible:
+                scroll_offset = cursor_pos - visible + 1
+        else:
+            cursor_pos = 0
+            scroll_offset = 0
+
+        draw(stdscr, todos, cursor_pos, scroll_offset, status_msg, current_ws_name, current_plan_name)
+        status_msg = ""
+
+        try:
+            ch = stdscr.get_wch()
+        except curses.error:
+            continue
+
+        if ch == "q" or ch == "Q":
+            break
+
+        elif ch == "k" or ch == curses.KEY_UP:
+            cursor_pos = max(0, cursor_pos - 1)
+
+        elif ch == "j" or ch == curses.KEY_DOWN:
+            if todos:
+                cursor_pos = min(len(todos) - 1, cursor_pos + 1)
+
+        elif ch == "g":
+            cursor_pos = 0
+
+        elif ch == "G":
+            if todos:
+                cursor_pos = len(todos) - 1
+
+        elif ch == "\n" or ch == " ":
+            if todos:
+                t = todos[cursor_pos]
+                toggle_todo(db, t[0], t[2])
+                status_msg = f"{'Unchecked' if t[2] else 'Completed'}: {t[1]}"
+
+        elif ch == "a" or ch == "A":
+            task = textbox_input(stdscr, "New task (ESC to cancel):")
+            if task and task.strip():
+                priority = "high" if ch == "A" else "medium"
+                add_todo(db, task.strip(), current_plan_id, priority)
+                status_msg = f"Added: {task.strip()}"
+
+        elif ch == "e":
+            if todos:
+                t = todos[cursor_pos]
+                new_task = textbox_input(stdscr, "Edit task (ESC to cancel):", prefill=t[1])
+                if new_task is not None and new_task.strip():
+                    edit_todo(db, t[0], new_task.strip())
+                    status_msg = "Updated task"
+
+        elif ch == "d" or ch == curses.KEY_DC:
+            if todos:
+                t = todos[cursor_pos]
+                delete_todo(db, t[0])
+                status_msg = f"Deleted: {t[1]}"
+
+        elif ch == "p":
+            if todos:
+                t = todos[cursor_pos]
+                cycle_priority(db, t[0], t[3])
+
+        elif ch == "c":
+            clear_done(db, current_plan_id)
+            status_msg = "Cleared completed tasks"
+
+        # ── Workspace switcher (w) ──
+        elif ch == "w":
+            workspaces = db.execute("SELECT id, name FROM workspaces ORDER BY id").fetchall()
+            # Append a "+ New workspace" option
+            options = list(workspaces) + [(-1, "+ New workspace")]
+            picked = popup_select(stdscr, "Switch workspace", options, lambda r: r[1])
+            if picked:
+                if picked[0] == -1:
+                    name = textbox_input(stdscr, "Workspace name:")
+                    if name and name.strip():
+                        name = name.strip()
+                        now = datetime.now().isoformat()
+                        if db.execute("SELECT 1 FROM workspaces WHERE name = ?", (name,)).fetchone():
+                            status_msg = f"Workspace '{name}' already exists"
+                        else:
+                            cur = db.execute("INSERT INTO workspaces (name, created_at) VALUES (?, ?)", (name, now))
+                            ws_id = cur.lastrowid
+                            db.execute(
+                                "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, 'default', 'active', ?)",
+                                (ws_id, now),
+                            )
+                            db.commit()
+                            current_ws_id, current_ws_name = ws_id, name
+                            plan_row = db.execute(
+                                "SELECT id, name FROM plans WHERE workspace_id = ? AND status = 'active' ORDER BY id LIMIT 1",
+                                (current_ws_id,),
+                            ).fetchone()
+                            current_plan_id, current_plan_name = plan_row[0], plan_row[1]
+                            cursor_pos, scroll_offset = 0, 0
+                            status_msg = f"Created workspace: {name}"
+                else:
+                    current_ws_id, current_ws_name = picked[0], picked[1]
+                    plan_row = db.execute(
+                        "SELECT id, name FROM plans WHERE workspace_id = ? AND status = 'active' ORDER BY id LIMIT 1",
+                        (current_ws_id,),
+                    ).fetchone()
+                    if plan_row:
+                        current_plan_id, current_plan_name = plan_row[0], plan_row[1]
+                    else:
+                        # Fallback: create a default plan
+                        now = datetime.now().isoformat()
+                        cur = db.execute(
+                            "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, 'default', 'active', ?)",
+                            (current_ws_id, now),
+                        )
+                        db.commit()
+                        current_plan_id, current_plan_name = cur.lastrowid, "default"
+                    cursor_pos, scroll_offset = 0, 0
+                    status_msg = f"Switched to workspace: {current_ws_name}"
+
+        # ── Plan switcher (Tab) ──
+        elif ch == "\t":
+            plans = db.execute(
+                "SELECT id, name FROM plans WHERE workspace_id = ? AND status = 'active' ORDER BY id",
+                (current_ws_id,),
+            ).fetchall()
+            if len(plans) > 1:
+                # Cycle to next plan
+                ids = [p[0] for p in plans]
+                try:
+                    idx = ids.index(current_plan_id)
+                    nxt = (idx + 1) % len(plans)
+                except ValueError:
+                    nxt = 0
+                current_plan_id, current_plan_name = plans[nxt][0], plans[nxt][1]
+                cursor_pos, scroll_offset = 0, 0
+                status_msg = f"Plan: {current_plan_name}"
+            elif len(plans) == 1:
+                status_msg = "Only one plan in this workspace"
+
+        # ── New plan (n) ──
+        elif ch == "n":
+            name = textbox_input(stdscr, "New plan name (ESC to cancel):")
+            if name and name.strip():
+                name = name.strip()
+                now = datetime.now().isoformat()
+                cur = db.execute(
+                    "INSERT INTO plans (workspace_id, name, status, created_at) VALUES (?, ?, 'active', ?)",
+                    (current_ws_id, name, now),
+                )
+                db.commit()
+                current_plan_id, current_plan_name = cur.lastrowid, name
+                cursor_pos, scroll_offset = 0, 0
+                status_msg = f"Created plan: {name}"
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        curses.wrapper(tui_main)
+        return
+
+    db = get_db()
+    resource = args[0]
+    rest = args[1:]
+
+    if resource == "workspace":
+        cli_workspace(db, rest)
+    elif resource == "plan":
+        cli_plan(db, rest)
+    elif resource == "task":
+        cli_task(db, rest)
+    else:
+        cli_error(f"Unknown command: {resource}. Use workspace, plan, or task.")
+
+
+if __name__ == "__main__":
+    main()
